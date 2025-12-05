@@ -1,0 +1,728 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import {
+  getFirestore, doc, setDoc, onSnapshot, collection, query, writeBatch,
+} from 'firebase/firestore';
+
+// --- 全局變數/環境配置 (Canvas 環境提供) ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'triage-counter-app';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+// FIX: Corrected typo from __initialAuthToken to __initial_auth_token
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null; 
+// Firestore collection path
+const DATA_PATH = `/artifacts/${appId}/public/data/triage_state`;
+const DOC_ID = 'live_state';
+const MAX_CLINICS = 7;
+
+// Utility to calculate the time remaining for stop clinic status
+const calculateTimeRemaining = (timestamp) => {
+  if (!timestamp || timestamp <= Date.now()) return null;
+  const remaining = timestamp - Date.now();
+  const minutes = Math.floor(remaining / 60000);
+  const seconds = Math.floor((remaining % 60000) / 1000);
+  return `${minutes}分${seconds.toString().padStart(2, '0')}秒`;
+};
+
+// Utility to get the next valid clinic index based on current index and stop timers
+const getNextValidClinic = (currentIndex, activeClinicsCount, stopTimers) => {
+  let nextIndex = currentIndex;
+  let attempts = 0;
+
+  // Maximum attempts is 2 * MAX_CLINICS to ensure we don't loop infinitely if all are stopped (which shouldn't happen)
+  while (attempts < MAX_CLINICS * 2) {
+    nextIndex = (nextIndex % activeClinicsCount) + 1;
+    attempts++;
+
+    const timer = stopTimers[`clinic-${nextIndex}`] || 0;
+    // If the clinic is not stopped, or the stop time has passed
+    if (timer === 0 || timer <= Date.now()) {
+      return nextIndex;
+    }
+
+    // If we looped back to the start and all are still stopped, return the original nextIndex
+    if (attempts >= activeClinicsCount) {
+        // Fallback: If all active clinics are stopped, just return the next clinic in sequence
+        return nextIndex;
+    }
+  }
+  return nextIndex;
+};
+
+
+// Main Component
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [isDataLoading, setIsDataLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  // --- Real-time State from Firestore ---
+  const [activeClinicsCount, setActiveClinicsCount] = useState(4); // 啟用診間數 (1-7)
+  const [nextT1Index, setNextT1Index] = useState(1); // T1 輪序
+  const [nextOtherIndex, setNextOtherIndex] = useState(1); // T2-T5 輪序
+  const [clinicData, setClinicData] = useState({}); // 診間計數和清單
+  const [stopTimers, setStopTimers] = useState({}); // 停診計時器 { 'clinic-1': timestamp }
+
+  // --- Local UI State ---
+  const [patientIdInput, setPatientIdInput] = useState('');
+  const [triageLevel, setTriageLevel] = useState('Other'); // 'T1' or 'Other'
+  const [isMajorOrOHCA, setIsMajorOrOHCA] = useState(false); // 是否為重大創傷/OHCA
+
+  // Timer for updating remaining time display
+  const [timeRemainingDisplay, setTimeRemainingDisplay] = useState({});
+
+  // 1. Firebase Initialization and Authentication
+  useEffect(() => {
+    if (!firebaseConfig) {
+      setError('Firebase 配置遺失。請檢查環境配置。');
+      return;
+    }
+
+    try {
+      const app = initializeApp(firebaseConfig);
+      const authInstance = getAuth(app);
+      const dbInstance = getFirestore(app);
+
+      setAuth(authInstance);
+      setDb(dbInstance);
+
+      const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+        } else {
+          // Sign in anonymously if no token is provided
+          try {
+            if (initialAuthToken) {
+              await signInWithCustomToken(authInstance, initialAuthToken);
+            } else {
+              await signInAnonymously(authInstance);
+            }
+          } catch (e) {
+            console.error('Firebase 認證失敗:', e);
+            setError('無法連線到資料庫：認證失敗。');
+          }
+        }
+        setIsAuthReady(true);
+      });
+
+      return () => unsubscribe();
+    } catch (e) {
+      console.error('Firebase 初始化失敗:', e);
+      setError('Firebase 初始化失敗。請檢查設定。');
+    }
+  }, []);
+
+  // 2. Real-time Data Listener
+  useEffect(() => {
+    if (!db || !isAuthReady) return;
+
+    const docRef = doc(db, DATA_PATH, DOC_ID);
+
+    const unsubscribe = onSnapshot(docRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        // Update all real-time states
+        setActiveClinicsCount(data.activeClinicsCount || 4);
+        setNextT1Index(data.nextT1Index || 1);
+        setNextOtherIndex(data.nextOtherIndex || 1);
+        setClinicData(data.clinics || {});
+        setStopTimers(data.stopTimers || {});
+      } else {
+        // Document does not exist, initialize it
+        console.log('數據文件不存在，正在初始化...');
+        const initialData = {
+          activeClinicsCount: 4,
+          nextT1Index: 1,
+          nextOtherIndex: 1,
+          clinics: {},
+          stopTimers: {},
+        };
+        // Initialize clinic data structure
+        for (let i = 1; i <= MAX_CLINICS; i++) {
+          initialData.clinics[`clinic-${i}`] = {
+            T1_count: 0, T1_list: [],
+            Other_count: 0, Other_list: [],
+          };
+          initialData.stopTimers[`clinic-${i}`] = 0;
+        }
+        setDoc(docRef, initialData)
+          .then(() => console.log('數據初始化成功。'))
+          .catch(e => console.error('數據初始化失敗:', e));
+      }
+      setIsDataLoading(false);
+    }, (e) => {
+      console.error('Firestore 監聽失敗:', e);
+      setError('實時資料監聽失敗。');
+      setIsDataLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [db, isAuthReady]);
+
+
+  // 3. Time Remaining Display Timer
+  useEffect(() => {
+    // Set up an interval to update the remaining time every second
+    const interval = setInterval(() => {
+      const newDisplay = {};
+      Object.keys(stopTimers).forEach(key => {
+        const timestamp = stopTimers[key];
+        newDisplay[key] = calculateTimeRemaining(timestamp);
+      });
+      setTimeRemainingDisplay(newDisplay);
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [stopTimers]);
+
+
+  // Derived State: The actual next clinic to recommend
+  const recommendedNextClinic = useMemo(() => {
+    const nextT1 = getNextValidClinic(nextT1Index - 1, activeClinicsCount, stopTimers);
+    const nextOther = getNextValidClinic(nextOtherIndex - 1, activeClinicsCount, stopTimers);
+
+    return {
+      T1: nextT1,
+      Other: nextOther,
+    };
+  }, [nextT1Index, nextOtherIndex, activeClinicsCount, stopTimers]);
+
+
+  // --- Data Manipulation Functions ---
+
+  // Function to save the main state back to Firestore
+  const saveStateToFirestore = useCallback(async (updates) => {
+    if (!db || !userId) {
+      console.error('資料庫未準備好或用戶未登入');
+      setError('資料庫錯誤：請稍候或刷新頁面。');
+      return;
+    }
+    try {
+      const docRef = doc(db, DATA_PATH, DOC_ID);
+      await setDoc(docRef, updates, { merge: true });
+    } catch (e) {
+      console.error('儲存狀態到 Firestore 失敗:', e);
+      setError('儲存資料失敗，請檢查連線。');
+    }
+  }, [db, userId]);
+
+  // Handle changing the number of active clinics
+  const handleActiveClinicsChange = useCallback((count) => {
+    if (count < 1 || count > MAX_CLINICS) return;
+
+    const newStopTimers = { ...stopTimers };
+    const newClinicData = { ...clinicData };
+
+    // Initialize/Reset data for newly added clinics (if any)
+    for (let i = 1; i <= MAX_CLINICS; i++) {
+      if (i > count) {
+        // Clear data for newly disabled clinics (optional, but safer)
+        if (newStopTimers[`clinic-${i}`]) newStopTimers[`clinic-${i}`] = 0;
+        if (newClinicData[`clinic-${i}`]) newClinicData[`clinic-${i}`] = { T1_count: 0, T1_list: [], Other_count: 0, Other_list: [] };
+      } else if (i > activeClinicsCount) {
+        // Initialize data for newly enabled clinics
+        if (!newClinicData[`clinic-${i}`]) newClinicData[`clinic-${i}`] = { T1_count: 0, T1_list: [], Other_count: 0, Other_list: [] };
+      }
+    }
+
+    // Recalculate next indices if they fall outside the new range
+    const newNextT1Index = nextT1Index > count ? 1 : nextT1Index;
+    const newNextOtherIndex = nextOtherIndex > count ? 1 : nextOtherIndex;
+
+    // Save the new state
+    saveStateToFirestore({
+      activeClinicsCount: count,
+      clinics: newClinicData,
+      stopTimers: newStopTimers,
+      nextT1Index: newNextT1Index,
+      nextOtherIndex: newNextOtherIndex,
+    });
+
+  }, [activeClinicsCount, nextT1Index, nextOtherIndex, clinicData, stopTimers, saveStateToFirestore]);
+
+  // Handle patient triage/registration
+  const handleTriage = useCallback(async (clinicIndex, level, majorOrOHCA) => {
+    const id = patientIdInput.trim();
+    if (!id) return alert('請貼上病歷號碼！');
+    if (!['T1', 'Other'].includes(level)) return; // Should not happen
+
+    // Get the current recommended index for the selected level
+    const currentNextIndex = level === 'T1' ? nextT1Index : nextOtherIndex;
+    const nextIndexKey = level === 'T1' ? 'nextT1Index' : 'nextOtherIndex';
+
+    // Check if the current recommended clinic is stopped
+    const isStopped = stopTimers[`clinic-${clinicIndex}`] > Date.now();
+    if (isStopped) {
+      // NOTE: Using a custom modal/notification is preferred over alert() in production,
+      // but for this environment, we stick to the required method/simpler alternative.
+      alert(`錯誤：診間 ${clinicIndex} 處於停診狀態，請等待下一輪序的指引。`);
+      return;
+    }
+
+    // --- Prepare Batch Write for Atomicity ---
+    const batch = writeBatch(db);
+    const docRef = doc(db, DATA_PATH, DOC_ID);
+
+    // 1. Update Clinic Data (Count and List)
+    const clinicKey = `clinic-${clinicIndex}`;
+    const currentClinicData = clinicData[clinicKey] || { T1_count: 0, T1_list: [], Other_count: 0, Other_list: [] };
+
+    const countKey = level === 'T1' ? 'T1_count' : 'Other_count';
+    const listKey = level === 'T1' ? 'T1_list' : 'Other_list';
+
+    // Ensure the list is a copy before modification
+    const newList = [...(currentClinicData[listKey] || [])];
+    if (newList.includes(id)) {
+        // NOTE: Using a custom modal/notification is preferred over alert()
+        alert('此病歷號已存在於此清單中。');
+        return;
+    }
+    newList.push(id);
+
+    // Update the clinic data in the batch
+    batch.update(docRef, {
+      [`clinics.${clinicKey}.${countKey}`]: (currentClinicData[countKey] || 0) + 1,
+      [`clinics.${clinicKey}.${listKey}`]: newList,
+    });
+
+    // 2. Update Next Index
+    // Calculate the index for the next rotation, skipping stopped clinics
+    const nextRotationIndex = getNextValidClinic(currentNextIndex, activeClinicsCount, stopTimers);
+
+    // Update the next index in the batch
+    batch.update(docRef, {
+      [nextIndexKey]: nextRotationIndex,
+    });
+
+    // 3. Handle Stop Clinic (if Major Trauma/OHCA button was clicked)
+    if (majorOrOHCA) {
+      // Set stop timer for 30 minutes
+      const stopUntil = Date.now() + 30 * 60 * 1000;
+      batch.update(docRef, {
+        [`stopTimers.${clinicKey}`]: stopUntil,
+      });
+      // Alert the triage staff
+      // NOTE: Using a custom modal/notification is preferred over alert()
+      setTimeout(() => alert(`診間 ${clinicIndex} 已設定停診 30 分鐘！`), 100);
+    }
+
+    // 4. Commit the Batch
+    try {
+      await batch.commit();
+      setPatientIdInput(''); // Clear input on successful registration
+      setIsMajorOrOHCA(false); // Reset button state
+    } catch (e) {
+      console.error('執行批次掛號失敗:', e);
+      setError('掛號操作失敗。');
+    }
+  }, [db, patientIdInput, activeClinicsCount, clinicData, nextT1Index, nextOtherIndex, stopTimers]);
+
+
+  // Handle patient removal (Correction)
+  const handleRemovePatient = useCallback(async (clinicIndex, level, id) => {
+    // NOTE: Using a custom modal/notification is preferred over window.confirm()
+    if (!window.confirm(`確定要將病歷號 ${id} 從 診間 ${clinicIndex} 的 ${level} 清單中移除嗎？`)) {
+      return;
+    }
+
+    const clinicKey = `clinic-${clinicIndex}`;
+    const currentClinicData = clinicData[clinicKey];
+
+    if (!currentClinicData) return;
+
+    const countKey = level === 'T1' ? 'T1_count' : 'Other_count';
+    const listKey = level === 'T1' ? 'T1_list' : 'Other_list';
+
+    const newList = (currentClinicData[listKey] || []).filter(pId => pId !== id);
+
+    // --- Prepare Batch Write for Atomicity ---
+    const batch = writeBatch(db);
+    const docRef = doc(db, DATA_PATH, DOC_ID);
+
+    // Update the clinic data in the batch
+    batch.update(docRef, {
+      [`clinics.${clinicKey}.${countKey}`]: Math.max(0, (currentClinicData[countKey] || 0) - 1),
+      [`clinics.${clinicKey}.${listKey}`]: newList,
+    });
+
+    // Commit the Batch
+    try {
+      await batch.commit();
+    } catch (e) {
+      console.error('執行批次移除失敗:', e);
+      setError('移除操作失敗。');
+    }
+  }, [db, clinicData]);
+
+
+  // Handle setting/clearing stop clinic timer
+  const handleToggleStopClinic = useCallback(async (clinicIndex) => {
+    const clinicKey = `clinic-${clinicIndex}`;
+    const currentTime = stopTimers[clinicKey] || 0;
+
+    const docRef = doc(db, DATA_PATH, DOC_ID);
+    let updateData = {};
+
+    if (currentTime > Date.now()) {
+      // Currently stopped, clear the timer
+      // NOTE: Using a custom modal/notification is preferred over window.confirm()
+      if (window.confirm(`確定要立即解除 診間 ${clinicIndex} 的停診狀態嗎？`)) {
+        updateData = { [`stopTimers.${clinicKey}`]: 0 };
+        // Recalculate next index if it was stuck on this clinic
+        const newNextT1Index = getNextValidClinic(nextT1Index - 1, activeClinicsCount, { ...stopTimers, [clinicKey]: 0 });
+        const newNextOtherIndex = getNextValidClinic(nextOtherIndex - 1, activeClinicsCount, { ...stopTimers, [clinicKey]: 0 });
+
+        updateData.nextT1Index = newNextT1Index;
+        updateData.nextOtherIndex = newNextOtherIndex;
+      } else {
+        return;
+      }
+    } else {
+      // Not currently stopped, set timer for 30 minutes
+      // NOTE: Using a custom modal/notification is preferred over window.confirm()
+      if (window.confirm(`確定要為 診間 ${clinicIndex} 設定停診 30 分鐘嗎？`)) {
+        const stopUntil = Date.now() + 30 * 60 * 1000;
+        updateData = { [`stopTimers.${clinicKey}`]: stopUntil };
+      } else {
+        return;
+      }
+    }
+
+    try {
+      await setDoc(docRef, updateData, { merge: true });
+    } catch (e) {
+      console.error('更新停診狀態失敗:', e);
+      setError('更新停診狀態失敗。');
+    }
+  }, [db, stopTimers, nextT1Index, nextOtherIndex, activeClinicsCount]);
+
+  // --- UI Components ---
+
+  const ClinicSetting = () => (
+    <div className="bg-white p-4 rounded-lg shadow-md mb-6 border border-gray-200">
+      <h2 className="text-xl font-bold mb-3 text-indigo-700 flex items-center">
+        <svg className="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+        當前啟用診間數設置
+      </h2>
+      <div className="flex flex-wrap gap-2">
+        {[...Array(MAX_CLINICS)].map((_, i) => {
+          const count = i + 1;
+          const isActive = activeClinicsCount === count;
+          return (
+            <button
+              key={count}
+              onClick={() => handleActiveClinicsChange(count)}
+              className={`px-4 py-2 rounded-full font-semibold transition duration-150 ${
+                isActive
+                  ? 'bg-indigo-600 text-white shadow-lg ring-4 ring-indigo-300'
+                  : 'bg-gray-100 text-gray-700 hover:bg-indigo-50 hover:text-indigo-600'
+              }`}
+              disabled={isDataLoading || !isAuthReady}
+              title={`啟用 ${count} 個診間`}
+            >
+              {count} 診
+            </button>
+          );
+        })}
+      </div>
+      <p className="mt-3 text-sm text-gray-500">當前啟用：<span className="font-semibold text-indigo-600">{activeClinicsCount} 診</span></p>
+    </div>
+  );
+
+  const TriageInput = () => (
+    <div className="bg-white p-6 rounded-lg shadow-xl mb-6 border-l-4 border-l-green-500">
+      <h2 className="text-2xl font-extrabold mb-4 text-gray-800">檢傷掛號操作區</h2>
+      <div className="flex flex-col sm:flex-row gap-4 mb-4">
+        {/* Patient ID Input */}
+        <input
+          type="text"
+          placeholder="貼上病歷號碼 (Patient ID)"
+          value={patientIdInput}
+          onChange={(e) => setPatientIdInput(e.target.value)}
+          className="flex-grow p-3 border-2 border-gray-300 rounded-lg focus:border-green-500 focus:ring-2 focus:ring-green-200 transition duration-150 text-lg font-mono"
+        />
+
+        {/* Level Selector */}
+        <select
+          value={triageLevel}
+          onChange={(e) => setTriageLevel(e.target.value)}
+          className="p-3 border-2 border-gray-300 rounded-lg bg-white focus:border-green-500 focus:ring-2 focus:ring-green-200 transition duration-150"
+        >
+          <option value="T1">一級病人 (T1)</option>
+          <option value="Other">其他病人 (T2-T5)</option>
+        </select>
+
+        {/* Major Trauma/OHCA Switch */}
+        <div className="flex items-center space-x-2">
+          <input
+            id="major-ohca-switch"
+            type="checkbox"
+            checked={isMajorOrOHCA}
+            onChange={(e) => setIsMajorOrOHCA(e.target.checked)}
+            className="w-5 h-5 text-red-600 border-gray-300 rounded focus:ring-red-500"
+          />
+          <label htmlFor="major-ohca-switch" className="text-red-600 font-semibold cursor-pointer whitespace-nowrap">
+            Major Trauma / OHCA (需停診)
+          </label>
+        </div>
+      </div>
+
+      {/* Recommended Clinic and Action Buttons */}
+      <div className="flex flex-col sm:flex-row gap-3 items-center">
+        <div className="flex-grow p-3 bg-green-50 rounded-lg border border-green-300 text-center font-bold text-lg w-full sm:w-auto">
+          建議掛號至：
+          <span className="text-green-700 ml-2 text-2xl">
+            診 {triageLevel === 'T1' ? recommendedNextClinic.T1 : recommendedNextClinic.Other}
+          </span>
+        </div>
+
+        <button
+          onClick={() => handleTriage(triageLevel === 'T1' ? recommendedNextClinic.T1 : recommendedNextClinic.Other, triageLevel, isMajorOrOHCA)}
+          className="w-full sm:w-auto px-6 py-3 bg-green-600 text-white font-bold rounded-xl shadow-md hover:bg-green-700 transition duration-150 disabled:bg-gray-400 disabled:cursor-not-allowed transform hover:scale-[1.02]"
+          disabled={!patientIdInput.trim()}
+        >
+          {triageLevel === 'T1' ? '掛號 (一級輪序)' : '掛號 (其他輪序)'}
+        </button>
+      </div>
+      <p className="mt-2 text-xs text-gray-500">
+        **注意：** 勾選 Major Trauma / OHCA 將會對被分配的診間設定 30 分鐘停診。
+      </p>
+    </div>
+  );
+
+  const Dashboard = () => (
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      {/* Clinic Count Dashboard */}
+      <div className="bg-white p-4 rounded-lg shadow-xl border border-gray-100">
+        <h2 className="text-2xl font-bold mb-4 text-blue-700">診間掛號數量概況</h2>
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead className="bg-blue-50">
+              <tr>
+                <th className="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">類別/輪序</th>
+                {[...Array(activeClinicsCount)].map((_, i) => (
+                  <th key={i} className="px-3 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    診 {i + 1}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-gray-200 text-sm">
+              {/* Row 1: T1 Count */}
+              <tr>
+                <td className="px-3 py-2 whitespace-nowrap font-semibold text-red-600">一級病人 (T1)</td>
+                {[...Array(activeClinicsCount)].map((_, i) => {
+                  const data = clinicData[`clinic-${i + 1}`];
+                  return (
+                    <td key={i} className="px-3 py-2 whitespace-nowrap text-center font-bold text-red-600 text-base">
+                      {data?.T1_count || 0}
+                    </td>
+                  );
+                })}
+              </tr>
+              {/* Row 2: Other Count */}
+              <tr>
+                <td className="px-3 py-2 whitespace-nowrap font-semibold text-indigo-600">其他病人 (T2-T5)</td>
+                {[...Array(activeClinicsCount)].map((_, i) => {
+                  const data = clinicData[`clinic-${i + 1}`];
+                  return (
+                    <td key={i} className="px-3 py-2 whitespace-nowrap text-center font-bold text-indigo-600 text-base">
+                      {data?.Other_count || 0}
+                    </td>
+                  );
+                })}
+              </tr>
+              {/* Row 3: Stop Timer */}
+              <tr>
+                <td className="px-3 py-2 whitespace-nowrap font-semibold text-gray-700">停診狀態/計時</td>
+                {[...Array(activeClinicsCount)].map((_, i) => {
+                  const clinicKey = `clinic-${i + 1}`;
+                  const time = timeRemainingDisplay[clinicKey];
+                  const isStopped = !!time;
+                  return (
+                    <td key={i} className={`px-3 py-2 whitespace-nowrap text-center font-semibold text-xs ${isStopped ? 'bg-yellow-100 text-red-700' : 'text-gray-500'}`}>
+                      {isStopped ? time : '正常'}
+                    </td>
+                  );
+                })}
+              </tr>
+              {/* Row 4: Next T1 Triage Indicator */}
+              <tr>
+                <td className="px-3 py-2 whitespace-nowrap font-semibold text-green-700 border-t border-green-200">
+                  一級病人輪序 (Next T1)
+                </td>
+                {[...Array(activeClinicsCount)].map((_, i) => {
+                  const isNext = recommendedNextClinic.T1 === (i + 1);
+                  return (
+                    <td key={i} className={`px-3 py-2 text-center text-xl font-extrabold ${isNext ? 'bg-green-200 text-green-800' : 'text-gray-300'}`}>
+                      {/* 更改為向上箭頭 */}
+                      {isNext ? '⬆' : ''}
+                    </td>
+                  );
+                })}
+              </tr>
+              {/* Row 5: Next Other Triage Indicator */}
+              <tr>
+                <td className="px-3 py-2 whitespace-nowrap font-semibold text-teal-700">
+                  其他病人輪序 (Next Other)
+                </td>
+                {[...Array(activeClinicsCount)].map((_, i) => {
+                  const isNext = recommendedNextClinic.Other === (i + 1);
+                  return (
+                    <td key={i} className={`px-3 py-2 text-center text-xl font-extrabold ${isNext ? 'bg-teal-200 text-teal-800' : 'text-gray-300'}`}>
+                      {/* 更改為向上箭頭 */}
+                      {isNext ? '⬆' : ''}
+                    </td>
+                  );
+                })}
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Stop Clinic Controls */}
+      <div className="bg-white p-4 rounded-lg shadow-xl border border-gray-100">
+        <h2 className="text-2xl font-bold mb-4 text-red-700">診間停診警示/控制</h2>
+        <div className="grid grid-cols-2 gap-4">
+          {[...Array(activeClinicsCount)].map((_, i) => {
+            const clinicIndex = i + 1;
+            const clinicKey = `clinic-${clinicIndex}`;
+            const time = timeRemainingDisplay[clinicKey];
+            const isStopped = !!time;
+            return (
+              <div
+                key={clinicIndex}
+                className={`p-3 rounded-lg border-2 ${isStopped ? 'bg-red-50 border-red-500 shadow-md' : 'bg-green-50 border-green-300'}`}
+              >
+                <div className="font-bold text-lg mb-1 flex justify-between items-center">
+                  <span className={isStopped ? 'text-red-700' : 'text-green-700'}>診 {clinicIndex}</span>
+                  <button
+                    onClick={() => handleToggleStopClinic(clinicIndex)}
+                    className={`text-xs px-2 py-1 rounded-full font-semibold transition duration-150 ${isStopped ? 'bg-red-500 text-white hover:bg-red-600' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}
+                    disabled={!isAuthReady}
+                  >
+                    {isStopped ? '強制解除停診' : '手動設定停診'}
+                  </button>
+                </div>
+                <p className={`text-sm ${isStopped ? 'text-red-600 font-bold' : 'text-green-600'}`}>
+                  {isStopped ? `停診中：剩餘 ${time}` : '狀態：正常運作'}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+
+  const PatientLists = () => (
+    <div className="bg-white p-4 rounded-lg shadow-xl mt-6 border-t-4 border-t-gray-300">
+      <h2 className="text-2xl font-bold mb-4 text-gray-800">各診間病歷號碼清單 (數據總覽)</h2>
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+        {[...Array(activeClinicsCount)].map((_, i) => {
+          const clinicIndex = i + 1;
+          const clinicKey = `clinic-${clinicIndex}`;
+          const data = clinicData[clinicKey] || { T1_list: [], Other_list: [] };
+
+          return (
+            <div key={clinicIndex} className="border border-gray-300 rounded-lg p-3 bg-gray-50">
+              <h3 className="text-xl font-bold mb-2 text-center text-purple-700 border-b pb-2">診 {clinicIndex} 清單</h3>
+
+              {/* T1 List */}
+              <p className="text-lg font-semibold text-red-600 mt-2">一級病人 ({data.T1_list.length} 位)</p>
+              <ul className="space-y-1 h-32 overflow-y-auto bg-white p-2 rounded-md border border-red-100">
+                {data.T1_list.length === 0 ? (
+                  <li className="text-sm text-gray-500 italic">無一級病人</li>
+                ) : (
+                  data.T1_list.map((id) => (
+                    <li key={id} className="flex justify-between items-center text-sm font-mono text-gray-800 bg-red-50 p-1 rounded">
+                      {id}
+                      <button
+                        onClick={() => handleRemovePatient(clinicIndex, 'T1', id)}
+                        className="text-red-500 hover:text-red-700 transition duration-150 p-0.5 rounded-full hover:bg-red-200"
+                        title="移除病人 (T1 修正)"
+                        disabled={!isAuthReady}
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                      </button>
+                    </li>
+                  ))
+                )}
+              </ul>
+
+              {/* Other List */}
+              <p className="text-lg font-semibold text-indigo-600 mt-3">其他病人 ({data.Other_list.length} 位)</p>
+              <ul className="space-y-1 h-32 overflow-y-auto bg-white p-2 rounded-md border border-indigo-100">
+                {data.Other_list.length === 0 ? (
+                  <li className="text-sm text-gray-500 italic">無其他病人</li>
+                ) : (
+                  data.Other_list.map((id) => (
+                    <li key={id} className="flex justify-between items-center text-sm font-mono text-gray-800 bg-indigo-50 p-1 rounded">
+                      {id}
+                      <button
+                        onClick={() => handleRemovePatient(clinicIndex, 'Other', id)}
+                        className="text-indigo-500 hover:text-indigo-700 transition duration-150 p-0.5 rounded-full hover:bg-indigo-200"
+                        title="移除病人 (Other 修正)"
+                        disabled={!isAuthReady}
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                      </button>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+
+  // --- Main Render ---
+
+  if (error) {
+    return <div className="p-8 text-center text-red-600 bg-red-100 border border-red-300 rounded-lg">錯誤：{error}</div>;
+  }
+
+  if (isDataLoading || !isAuthReady) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50">
+        <div className="text-center p-8 bg-white rounded-lg shadow-lg">
+          <svg className="animate-spin h-8 w-8 text-indigo-600 mx-auto mb-3" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+          </svg>
+          <p className="text-lg font-semibold text-indigo-700">載入中... 正在建立實時連線</p>
+          <p className="text-sm text-gray-500 mt-1">用戶 ID: {userId || '等待認證'}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-4 sm:p-6 md:p-8 bg-gray-50 min-h-screen font-sans">
+      <h1 className="text-3xl sm:text-4xl font-extrabold mb-6 text-center text-gray-900 border-b-4 border-indigo-500 pb-3">
+        急診檢傷分診計數器 (即時同步)
+      </h1>
+
+      <ClinicSetting />
+
+      <TriageInput />
+
+      <Dashboard />
+
+      <PatientLists />
+
+      <div className="mt-8 pt-4 border-t text-sm text-gray-500 text-center">
+        <p>資料狀態：已連線 (用戶 ID: {userId})。所有操作將即時同步到所有裝置。</p>
+      </div>
+    </div>
+  );
+};
+
+export default App;
